@@ -1,0 +1,9 @@
+.e# Credenciais e variáveis locais
+.env
+
+# Arquivos gerados pelo Python
+__pycache__/
+*.py[cod]
+
+# Configurações locais do VS Code
+.vscode/
