@@ -32,6 +32,7 @@ class Equipamento:
     redes_clientes: tuple[str, ...] = ()
 
 
+
 @dataclass
 class ResultadoEquipamento:
     nome: str
