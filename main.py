@@ -3,12 +3,23 @@ import os
 import paramiko
 from dotenv import load_dotenv
 
+
 load_dotenv()
 
-HOST = os.getenv("MIKROTIK_HOST", "")
-PORT = int(os.getenv("MIKROTIK_PORT", "22"))
-USERNAME = os.getenv("MIKROTIK_USER", "")
+
+USER = os.getenv("MIKROTIK_USER", "")
 PASSWORD = os.getenv("MIKROTIK_PASSWORD", "")
+PORT = int(os.getenv("MIKROTIK_PORT", "22"))
+
+
+MIKROTIKS = [
+    ("MT1", os.getenv("MT1_HOST", "")),
+    ("MT2", os.getenv("MT2_HOST", "")),
+    ("MT3", os.getenv("MT3_HOST", "")),
+    ("MT4", os.getenv("MT4_HOST", "")),
+    ("MT5", os.getenv("MT5_HOST", "")),
+]
+
 
 COMANDOS = [
     ("IDENTIDADE", "/system identity print"),
@@ -19,7 +30,26 @@ COMANDOS = [
     ("VIZINHOS OSPF", "/routing ospf neighbor print"),
     ("SESSÕES BGP", "/routing bgp session print"),
     ("CLIENTES PPPOE ATIVOS", "/ppp active print"),
+    ("TABELA ARP", "/ip arp print"),
 ]
+
+
+def conectar(host: str) -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+
+    client.set_missing_host_key_policy(
+        paramiko.AutoAddPolicy()
+    )
+
+    client.connect(
+        hostname=host,
+        port=PORT,
+        username=USER,
+        password=PASSWORD,
+        timeout=10,
+    )
+
+    return client
 
 
 def executar_comando(
@@ -31,52 +61,92 @@ def executar_comando(
 
     _, stdout, stderr = client.exec_command(comando)
 
-    resultado = stdout.read().decode("utf-8")
-    erro = stderr.read().decode("utf-8")
+    saida = stdout.read().decode("utf-8").strip()
+    erro = stderr.read().decode("utf-8").strip()
 
-    if erro.strip():
-        print(f"Erro retornado pelo MikroTik:\n{erro}")
-    elif resultado.strip():
-        print(resultado)
-    else:
-        print("Nenhum dado retornado.")
+    if saida:
+        print(saida)
+
+    if erro:
+        print(f"ERRO: {erro}")
+
+    if not saida and not erro:
+        print("Nenhuma informação retornada.")
+
+
+def validar_configuracao() -> None:
+    if not USER:
+        raise ValueError(
+            "MIKROTIK_USER não foi definido no arquivo .env."
+        )
+
+    if not PASSWORD:
+        raise ValueError(
+            "MIKROTIK_PASSWORD não foi definido no arquivo .env."
+        )
+
+    equipamentos_sem_host = [
+        nome
+        for nome, host in MIKROTIKS
+        if not host
+    ]
+
+    if equipamentos_sem_host:
+        nomes = ", ".join(equipamentos_sem_host)
+
+        raise ValueError(
+            f"Host não definido para: {nomes}."
+        )
 
 
 def main() -> None:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    validar_configuracao()
 
-    try:
-        print(f"Conectando ao MikroTik {HOST}...")
+    for nome, host in MIKROTIKS:
+        print("\n")
+        print("=" * 60)
+        print(f"Conectando ao {nome} - {host}")
+        print("=" * 60)
 
-        client.connect(
-            hostname=HOST,
-            port=PORT,
-            username=USERNAME,
-            password=PASSWORD,
-            timeout=10,
-        )
+        client = None
 
-        print("Conectado com sucesso!")
+        try:
+            client = conectar(host)
 
-        for titulo, comando in COMANDOS:
-            executar_comando(client, titulo, comando)
+            print(f"Conexão SSH com {nome} realizada com sucesso.")
 
-    except paramiko.AuthenticationException:
-        print("Falha na autenticação. Verifique o usuário e a senha.")
+            for titulo, comando in COMANDOS:
+                executar_comando(
+                    client,
+                    titulo,
+                    comando,
+                )
 
-    except paramiko.SSHException as erro:
-        print(f"Erro na conexão SSH: {erro}")
+        except paramiko.AuthenticationException:
+            print(
+                f"Falha de autenticação no {nome}. "
+                "Verifique usuário e senha."
+            )
 
-    except TimeoutError:
-        print("A conexão excedeu o tempo limite.")
+        except paramiko.SSHException as erro:
+            print(
+                f"Erro de SSH no {nome}: {erro}"
+            )
 
-    except Exception as erro:
-        print(f"Falha durante a execução: {erro}")
+        except TimeoutError:
+            print(
+                f"Tempo de conexão esgotado no {nome}."
+            )
 
-    finally:
-        client.close()
-        print("\nConexão encerrada.")
+        except OSError as erro:
+            print(
+                f"Não foi possível conectar ao {nome}: {erro}"
+            )
+
+        finally:
+            if client is not None:
+                client.close()
+                print(f"\nConexão com {nome} encerrada.")
 
 
 if __name__ == "__main__":
