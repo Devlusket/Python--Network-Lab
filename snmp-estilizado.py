@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import getpass
-import ipaddress
 import re
 import shlex
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import paramiko
@@ -43,16 +43,10 @@ SNMP_RETRIES = 1
 
 SSH_PORT = 22
 SSH_TIMEOUT = 5
+SSH_PRIVATE_KEY = Path("~/.ssh/id_ed25519_mikrotik").expanduser()
 
 # Intervalo usado para calcular tráfego atual.
 TRAFFIC_SAMPLE_SECONDS = 2.0
-
-# Redes consideradas redes de clientes no seu laboratório.
-# ARP das redes de enlaces e gerenciamento não entra nessa contagem.
-CLIENT_NETWORKS = [
-    ipaddress.ip_network("192.168.2.0/24"),
-    ipaddress.ip_network("192.168.3.0/24"),
-]
 
 CPU_WARNING = 70
 CPU_CRITICAL = 90
@@ -135,7 +129,7 @@ class RouterReport:
     bgp_configurado: bool = False
 
     pppoe: list[dict[str, str]] = field(default_factory=list)
-    clientes_ethernet: list[dict[str, str]] = field(default_factory=list)
+    dhcp_leases: list[dict[str, str]] = field(default_factory=list)
 
     falhas: list[str] = field(default_factory=list)
 
@@ -347,15 +341,6 @@ def parse_terse_records(texto: str) -> list[dict[str, str]]:
     return registros
 
 
-def ip_eh_cliente(endereco: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(endereco)
-    except ValueError:
-        return False
-
-    return any(ip in rede for rede in CLIENT_NETWORKS)
-
-
 # ============================================================
 # SNMP
 # ============================================================
@@ -544,28 +529,84 @@ async def medir_trafego(router: Router) -> dict[int, dict[str, float]]:
 # SSH
 # ============================================================
 
-def executar_ssh_sync(
+def criar_cliente_ssh() -> paramiko.SSHClient:
+    """Cria um cliente Paramiko com a política usada pelo laboratório."""
+    cliente = paramiko.SSHClient()
+    cliente.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    return cliente
+
+
+def conectar_ssh_sync(
     router: Router,
     usuario: str,
     senha: str,
+) -> tuple[paramiko.SSHClient | None, str, str]:
+    """
+    Tenta autenticar primeiro com a chave privada e depois com senha.
+
+    Retorna (cliente, metodo, erro). Quando a conexão falha, cliente é None.
+    Um cliente novo é criado para cada tentativa porque uma falha de
+    autenticação pode deixar o transporte anterior inutilizável.
+    """
+    erros: list[str] = []
+
+    if SSH_PRIVATE_KEY.is_file():
+        cliente = criar_cliente_ssh()
+        try:
+            cliente.connect(
+                hostname=router.ip,
+                port=SSH_PORT,
+                username=usuario,
+                key_filename=str(SSH_PRIVATE_KEY),
+                timeout=SSH_TIMEOUT,
+                auth_timeout=SSH_TIMEOUT,
+                banner_timeout=SSH_TIMEOUT,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            return cliente, "chave SSH", ""
+        except paramiko.AuthenticationException:
+            erros.append("chave SSH rejeitada")
+            cliente.close()
+        except Exception as exc:
+            erros.append(f"chave SSH: {exc}")
+            cliente.close()
+    else:
+        erros.append(f"chave não encontrada em {SSH_PRIVATE_KEY}")
+
+    if senha:
+        cliente = criar_cliente_ssh()
+        try:
+            cliente.connect(
+                hostname=router.ip,
+                port=SSH_PORT,
+                username=usuario,
+                password=senha,
+                timeout=SSH_TIMEOUT,
+                auth_timeout=SSH_TIMEOUT,
+                banner_timeout=SSH_TIMEOUT,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            return cliente, "senha", ""
+        except paramiko.AuthenticationException:
+            erros.append("senha rejeitada")
+            cliente.close()
+        except Exception as exc:
+            erros.append(f"senha: {exc}")
+            cliente.close()
+    else:
+        erros.append("senha não informada")
+
+    return None, "", "; ".join(erros)
+
+
+def executar_comando_no_cliente(
+    cliente: paramiko.SSHClient,
     comando: str,
 ) -> SSHResult:
-    cliente = paramiko.SSHClient()
-    cliente.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
+    """Executa um comando usando uma sessão SSH já autenticada."""
     try:
-        cliente.connect(
-            hostname=router.ip,
-            port=SSH_PORT,
-            username=usuario,
-            password=senha,
-            timeout=SSH_TIMEOUT,
-            auth_timeout=SSH_TIMEOUT,
-            banner_timeout=SSH_TIMEOUT,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-
         _, stdout, stderr = cliente.exec_command(comando, timeout=15)
         saida = stdout.read().decode("utf-8", errors="replace").strip()
         erro = stderr.read().decode("utf-8", errors="replace").strip()
@@ -574,13 +615,22 @@ def executar_ssh_sync(
             return SSHResult(False, error=erro)
 
         return SSHResult(True, output=saida, error=erro)
-
-    except paramiko.AuthenticationException:
-        return SSHResult(False, error="falha de autenticação")
-
     except Exception as exc:
         return SSHResult(False, error=str(exc))
 
+
+def executar_ssh_sync(
+    router: Router,
+    usuario: str,
+    senha: str,
+    comando: str,
+) -> SSHResult:
+    cliente, _, erro = conectar_ssh_sync(router, usuario, senha)
+    if cliente is None:
+        return SSHResult(False, error=f"falha de autenticação ({erro})")
+
+    try:
+        return executar_comando_no_cliente(cliente, comando)
     finally:
         cliente.close()
 
@@ -600,24 +650,48 @@ async def executar_ssh(
     )
 
 
-async def coletar_dados_ssh(router: Router, usuario: str, senha: str) -> dict[str, SSHResult]:
+def coletar_dados_ssh_sync(
+    router: Router,
+    usuario: str,
+    senha: str,
+) -> dict[str, SSHResult]:
+    """
+    Abre uma única sessão SSH por roteador e executa todas as consultas
+    sequencialmente nela. Isso evita cinco handshakes simultâneos por CHR.
+    """
     comandos = {
         "resource": "/system resource print",
         "ospf": "/routing ospf neighbor print terse without-paging",
         "bgp": "/routing bgp session print terse without-paging",
         "pppoe": "/ppp active print terse without-paging",
-        "arp": "/ip arp print terse without-paging",
+        "dhcp": "/ip dhcp-server lease print terse without-paging",
     }
 
-    tarefas = {
-        nome: asyncio.create_task(executar_ssh(router, usuario, senha, comando))
-        for nome, comando in comandos.items()
-    }
+    cliente, _, erro = conectar_ssh_sync(router, usuario, senha)
+    if cliente is None:
+        falha = SSHResult(False, error=f"falha de autenticação ({erro})")
+        return {nome: falha for nome in comandos}
 
-    return {
-        nome: await tarefa
-        for nome, tarefa in tarefas.items()
-    }
+    try:
+        return {
+            nome: executar_comando_no_cliente(cliente, comando)
+            for nome, comando in comandos.items()
+        }
+    finally:
+        cliente.close()
+
+
+async def coletar_dados_ssh(
+    router: Router,
+    usuario: str,
+    senha: str,
+) -> dict[str, SSHResult]:
+    return await asyncio.to_thread(
+        coletar_dados_ssh_sync,
+        router,
+        usuario,
+        senha,
+    )
 
 
 # ============================================================
@@ -687,18 +761,21 @@ def interpretar_pppoe(saida: str, report: RouterReport) -> None:
         })
 
 
-def interpretar_arp(saida: str, report: RouterReport) -> None:
+def interpretar_dhcp_leases(saida: str, report: RouterReport) -> None:
+    """Registra apenas leases DHCP atualmente ativas (status=bound)."""
     registros = parse_terse_records(saida)
 
     for registro in registros:
-        endereco = registro.get("address", "")
-        if not ip_eh_cliente(endereco):
+        if registro.get("status", "").lower() != "bound":
             continue
 
-        report.clientes_ethernet.append({
-            "ip": endereco,
+        report.dhcp_leases.append({
+            "ip": registro.get("address", "sem IP"),
             "mac": registro.get("mac-address", "—"),
-            "interface": registro.get("interface", "—"),
+            "hostname": registro.get("host-name", "—"),
+            "servidor": registro.get("server", "—"),
+            "expira_em": registro.get("expires-after", "—"),
+            "ultima_vez": registro.get("last-seen", "—"),
             "status": registro.get("status", "—"),
         })
 
@@ -744,10 +821,10 @@ async def coletar_relatorio_router(
     elif report.ssh_online:
         report.falhas.append("falha ao consultar PPPoE")
 
-    if dados_ssh["arp"].ok:
-        interpretar_arp(dados_ssh["arp"].output, report)
+    if dados_ssh["dhcp"].ok:
+        interpretar_dhcp_leases(dados_ssh["dhcp"].output, report)
     elif report.ssh_online:
-        report.falhas.append("falha ao consultar ARP")
+        report.falhas.append("falha ao consultar leases DHCP")
 
     if not report.snmp_online:
         report.falhas.append("SNMP indisponível")
@@ -842,15 +919,16 @@ def exibir_router_card(report: RouterReport) -> None:
 
     linha_tabela(
         tabela,
-        "Clientes Ethernet",
-        Text(f"✓ {len(report.clientes_ethernet)} detectado(s)", style="bold green"),
+        "Leases DHCP ativas",
+        Text(f"✓ {len(report.dhcp_leases)} bound", style="bold green"),
     )
 
-    for cliente in report.clientes_ethernet:
+    for lease in report.dhcp_leases:
+        identificacao = lease["hostname"] if lease["hostname"] != "—" else lease["mac"]
         linha_tabela(
             tabela,
-            f"  ↳ {cliente['ip']}",
-            f"{cliente['interface']} | {cliente['status']}",
+            f"  ↳ {identificacao}",
+            f"{lease['ip']} | expira em {lease['expira_em']}",
         )
 
     if report.falhas:
@@ -881,7 +959,7 @@ def exibir_resumo(reports: list[RouterReport], inicio: float) -> None:
     bgp_total = sum(r.bgp_total for r in reports)
     bgp_established = sum(r.bgp_established for r in reports)
     pppoe = sum(len(r.pppoe) for r in reports)
-    ethernet = sum(len(r.clientes_ethernet) for r in reports)
+    dhcp = sum(len(r.dhcp_leases) for r in reports)
 
     alertas_cpu = [r for r in reports if r.cpu is not None and r.cpu >= CPU_WARNING]
     alertas_memoria = [
@@ -930,8 +1008,8 @@ def exibir_resumo(reports: list[RouterReport], inicio: float) -> None:
     linha_tabela(tabela, "Clientes PPPoE", Text(f"✓ {pppoe} ativo(s)", style="bold green"))
     linha_tabela(
         tabela,
-        "Clientes Ethernet",
-        Text(f"✓ {ethernet} detectado(s)", style="bold green"),
+        "Leases DHCP ativas",
+        Text(f"✓ {dhcp} bound", style="bold green"),
     )
     linha_tabela(
         tabela,
@@ -1189,15 +1267,15 @@ async def mostrar_pppoe_formatado(router: Router, usuario: str, senha: str) -> N
     console.print(tabela)
 
 
-async def mostrar_clientes_ethernet(router: Router, usuario: str, senha: str) -> None:
+async def mostrar_clientes_dhcp(router: Router, usuario: str, senha: str) -> None:
     limpar_tela()
-    console.rule(f"[bold cyan]{router.nome} — CLIENTES ETHERNET[/bold cyan]")
+    console.rule(f"[bold cyan]{router.nome} — LEASES DHCP ATIVAS[/bold cyan]")
 
     resultado = await executar_ssh(
         router,
         usuario,
         senha,
-        "/ip arp print terse without-paging",
+        "/ip dhcp-server lease print terse without-paging",
     )
 
     if not resultado.ok:
@@ -1206,27 +1284,29 @@ async def mostrar_clientes_ethernet(router: Router, usuario: str, senha: str) ->
 
     registros = [
         r for r in parse_terse_records(resultado.output)
-        if ip_eh_cliente(r.get("address", ""))
+        if r.get("status", "").lower() == "bound"
     ]
 
     if not registros:
-        console.print("[dim]Nenhum cliente Ethernet detectado nas redes configuradas.[/dim]")
+        console.print("[dim]Nenhuma lease DHCP ativa neste equipamento.[/dim]")
         return
 
     tabela = Table(box=box.ROUNDED, header_style="bold cyan")
     tabela.add_column("Endereço IP")
     tabela.add_column("MAC")
-    tabela.add_column("Interface")
-    tabela.add_column("Status")
-    tabela.add_column("Flags")
+    tabela.add_column("Hostname")
+    tabela.add_column("Servidor")
+    tabela.add_column("Expira em")
+    tabela.add_column("Último contato")
 
     for registro in registros:
         tabela.add_row(
             registro.get("address", "—"),
             registro.get("mac-address", "—"),
-            registro.get("interface", "—"),
-            registro.get("status", "—"),
-            registro.get("_flags", "—"),
+            registro.get("host-name", "—"),
+            registro.get("server", "—"),
+            registro.get("expires-after", "—"),
+            registro.get("last-seen", "—"),
         )
 
     console.print(tabela)
@@ -1367,7 +1447,7 @@ async def menu_equipamento(router: Router, usuario: str, senha: str) -> None:
             ("3", "Vizinhos OSPF"),
             ("4", "Sessões BGP"),
             ("5", "Clientes PPPoE"),
-            ("6", "Clientes Ethernet"),
+            ("6", "Leases DHCP ativas"),
             ("7", "Tabela ARP completa"),
             ("8", "Rotas"),
             ("9", "Consulta manual SNMP"),
@@ -1419,7 +1499,7 @@ async def menu_equipamento(router: Router, usuario: str, senha: str) -> None:
         elif opcao == "5":
             await mostrar_pppoe_formatado(router, usuario, senha)
         elif opcao == "6":
-            await mostrar_clientes_ethernet(router, usuario, senha)
+            await mostrar_clientes_dhcp(router, usuario, senha)
         elif opcao == "7":
             await mostrar_saida_ssh(
                 router,
