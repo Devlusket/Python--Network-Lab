@@ -128,6 +128,14 @@ class RouterReport:
     bgp_established: int = 0
     bgp_configurado: bool = False
 
+    ldp_total: int = 0
+    ldp_operational: int = 0
+    ldp_configurado: bool = False
+    mpls_forwarding_entries: int = 0
+    ldp_local_mappings: int = 0
+    ldp_remote_mappings: int = 0
+    ldp_neighbors: list[dict[str, str]] = field(default_factory=list)
+
     pppoe: list[dict[str, str]] = field(default_factory=list)
     dhcp_leases: list[dict[str, str]] = field(default_factory=list)
 
@@ -663,6 +671,10 @@ def coletar_dados_ssh_sync(
         "resource": "/system resource print",
         "ospf": "/routing ospf neighbor print terse without-paging",
         "bgp": "/routing bgp session print terse without-paging",
+        "ldp_neighbors": "/mpls ldp neighbor print terse without-paging",
+        "mpls_forwarding": "/mpls forwarding-table print terse without-paging",
+        "ldp_local": "/mpls ldp local-mapping print terse without-paging",
+        "ldp_remote": "/mpls ldp remote-mapping print terse without-paging",
         "pppoe": "/ppp active print terse without-paging",
         "dhcp": "/ip dhcp-server lease print terse without-paging",
     }
@@ -746,6 +758,56 @@ def interpretar_bgp(saida: str, report: RouterReport) -> None:
     report.bgp_configurado = report.bgp_total > 0
 
 
+def interpretar_ldp_neighbors(saida: str, report: RouterReport) -> None:
+    """Interpreta vizinhos LDP e identifica sessões operacionais."""
+    registros = parse_terse_records(saida)
+    report.ldp_total = len(registros)
+    report.ldp_neighbors = []
+
+    operacionais = 0
+    for registro in registros:
+        flags = registro.get("_flags", "").upper()
+        estado = registro.get("state", "").lower()
+        operacional = (
+            "O" in flags
+            or estado == "operational"
+            or registro.get("operational", "").lower() in {"yes", "true"}
+        )
+
+        if operacional:
+            operacionais += 1
+
+        report.ldp_neighbors.append({
+            "transport": registro.get("transport", "—"),
+            "local_transport": registro.get("local-transport", "—"),
+            "peer": registro.get("peer", "—"),
+            "addresses": registro.get("addresses", "—"),
+            "status": "OPERATIONAL" if operacional else (estado.upper() or "INATIVO"),
+            "flags": flags or "—",
+        })
+
+    report.ldp_operational = operacionais
+    report.ldp_configurado = report.ldp_total > 0
+
+
+def interpretar_mpls_forwarding(saida: str, report: RouterReport) -> None:
+    report.mpls_forwarding_entries = len(parse_terse_records(saida))
+    if report.mpls_forwarding_entries > 0:
+        report.ldp_configurado = True
+
+
+def interpretar_ldp_mappings(
+    local_saida: str,
+    remote_saida: str,
+    report: RouterReport,
+) -> None:
+    report.ldp_local_mappings = len(parse_terse_records(local_saida))
+    report.ldp_remote_mappings = len(parse_terse_records(remote_saida))
+
+    if report.ldp_local_mappings > 0 or report.ldp_remote_mappings > 0:
+        report.ldp_configurado = True
+
+
 def interpretar_pppoe(saida: str, report: RouterReport) -> None:
     registros = parse_terse_records(saida)
 
@@ -815,6 +877,25 @@ async def coletar_relatorio_router(
         interpretar_bgp(dados_ssh["bgp"].output, report)
     elif report.ssh_online:
         report.falhas.append("falha ao consultar BGP")
+
+    if dados_ssh["ldp_neighbors"].ok:
+        interpretar_ldp_neighbors(dados_ssh["ldp_neighbors"].output, report)
+    elif report.ssh_online:
+        report.falhas.append("falha ao consultar vizinhos LDP")
+
+    if dados_ssh["mpls_forwarding"].ok:
+        interpretar_mpls_forwarding(dados_ssh["mpls_forwarding"].output, report)
+    elif report.ssh_online:
+        report.falhas.append("falha ao consultar forwarding MPLS")
+
+    if dados_ssh["ldp_local"].ok and dados_ssh["ldp_remote"].ok:
+        interpretar_ldp_mappings(
+            dados_ssh["ldp_local"].output,
+            dados_ssh["ldp_remote"].output,
+            report,
+        )
+    elif report.ssh_online:
+        report.falhas.append("falha ao consultar mappings LDP")
 
     if dados_ssh["pppoe"].ok:
         interpretar_pppoe(dados_ssh["pppoe"].output, report)
@@ -904,6 +985,28 @@ def exibir_router_card(report: RouterReport) -> None:
     else:
         linha_tabela(tabela, "BGP", Text("— não configurado", style="dim"))
 
+    if report.ldp_configurado:
+        ldp_ok = report.ldp_total > 0 and report.ldp_operational == report.ldp_total
+        linha_tabela(
+            tabela,
+            "Vizinhos LDP",
+            Text(
+                f"{'✓' if ldp_ok else '⚠'} "
+                f"{report.ldp_operational}/{report.ldp_total} operacionais",
+                style="bold green" if ldp_ok else "bold yellow",
+            ),
+        )
+        linha_tabela(
+            tabela,
+            "Forwarding MPLS",
+            Text(
+                f"✓ {report.mpls_forwarding_entries} entrada(s)",
+                style="bold green",
+            ),
+        )
+    else:
+        linha_tabela(tabela, "MPLS / LDP", Text("— não configurado", style="dim"))
+
     linha_tabela(
         tabela,
         "Clientes PPPoE",
@@ -958,6 +1061,9 @@ def exibir_resumo(reports: list[RouterReport], inicio: float) -> None:
     ospf_full = sum(r.ospf_full for r in reports)
     bgp_total = sum(r.bgp_total for r in reports)
     bgp_established = sum(r.bgp_established for r in reports)
+    ldp_total = sum(r.ldp_total for r in reports)
+    ldp_operational = sum(r.ldp_operational for r in reports)
+    mpls_forwarding = sum(r.mpls_forwarding_entries for r in reports)
     pppoe = sum(len(r.pppoe) for r in reports)
     dhcp = sum(len(r.dhcp_leases) for r in reports)
 
@@ -1005,6 +1111,24 @@ def exibir_resumo(reports: list[RouterReport], inicio: float) -> None:
             style="bold green" if bgp_established == bgp_total else "bold yellow",
         ),
     )
+    if ldp_total > 0:
+        linha_tabela(
+            tabela,
+            "Vizinhos LDP",
+            Text(
+                f"{'✓' if ldp_operational == ldp_total else '⚠'} "
+                f"{ldp_operational}/{ldp_total} operacionais",
+                style="bold green" if ldp_operational == ldp_total else "bold yellow",
+            ),
+        )
+        linha_tabela(
+            tabela,
+            "Forwarding MPLS",
+            Text(f"✓ {mpls_forwarding} entrada(s)", style="bold green"),
+        )
+    else:
+        linha_tabela(tabela, "MPLS / LDP", Text("— não configurado", style="dim"))
+
     linha_tabela(tabela, "Clientes PPPoE", Text(f"✓ {pppoe} ativo(s)", style="bold green"))
     linha_tabela(
         tabela,
@@ -1312,6 +1436,159 @@ async def mostrar_clientes_dhcp(router: Router, usuario: str, senha: str) -> Non
     console.print(tabela)
 
 
+async def mostrar_mpls_ldp(router: Router, usuario: str, senha: str) -> None:
+    """Exibe vizinhos, contadores e tabelas principais de MPLS/LDP."""
+    limpar_tela()
+    console.rule(f"[bold cyan]{router.nome} — MPLS / LDP[/bold cyan]")
+    console.print("[dim]Consultando vizinhos, forwarding e mappings via SSH...[/dim]\n")
+
+    comandos = {
+        "neighbors": "/mpls ldp neighbor print terse without-paging",
+        "forwarding": "/mpls forwarding-table print without-paging",
+        "forwarding_terse": "/mpls forwarding-table print terse without-paging",
+        "local": "/mpls ldp local-mapping print without-paging",
+        "local_terse": "/mpls ldp local-mapping print terse without-paging",
+        "remote": "/mpls ldp remote-mapping print without-paging",
+        "remote_terse": "/mpls ldp remote-mapping print terse without-paging",
+    }
+
+    def coletar_sync() -> dict[str, SSHResult]:
+        cliente, _, erro = conectar_ssh_sync(router, usuario, senha)
+        if cliente is None:
+            falha = SSHResult(False, error=f"falha de autenticação ({erro})")
+            return {nome: falha for nome in comandos}
+
+        try:
+            return {
+                nome: executar_comando_no_cliente(cliente, comando)
+                for nome, comando in comandos.items()
+            }
+        finally:
+            cliente.close()
+
+    resultados = await asyncio.to_thread(coletar_sync)
+
+    if not resultados["neighbors"].ok:
+        console.print(
+            f"[bold red]Falha ao consultar MPLS/LDP:[/bold red] "
+            f"{resultados['neighbors'].error}"
+        )
+        return
+
+    vizinhos = parse_terse_records(resultados["neighbors"].output)
+    forwarding_count = (
+        len(parse_terse_records(resultados["forwarding_terse"].output))
+        if resultados["forwarding_terse"].ok else 0
+    )
+    local_count = (
+        len(parse_terse_records(resultados["local_terse"].output))
+        if resultados["local_terse"].ok else 0
+    )
+    remote_count = (
+        len(parse_terse_records(resultados["remote_terse"].output))
+        if resultados["remote_terse"].ok else 0
+    )
+
+    operacionais = 0
+    for vizinho in vizinhos:
+        flags = vizinho.get("_flags", "").upper()
+        estado = vizinho.get("state", "").lower()
+        if "O" in flags or estado == "operational":
+            operacionais += 1
+
+    resumo = Table.grid(padding=(0, 2))
+    resumo.add_column(width=23)
+    resumo.add_column()
+    linha_tabela(
+        resumo,
+        "Estado LDP",
+        Text(
+            "✓ OPERACIONAL" if vizinhos and operacionais == len(vizinhos)
+            else ("⚠ PARCIAL" if vizinhos else "— sem vizinhos"),
+            style=(
+                "bold green" if vizinhos and operacionais == len(vizinhos)
+                else ("bold yellow" if vizinhos else "dim")
+            ),
+        ),
+    )
+    linha_tabela(resumo, "Vizinhos", f"{operacionais}/{len(vizinhos)} operacionais")
+    linha_tabela(resumo, "Forwarding MPLS", f"{forwarding_count} entrada(s)")
+    linha_tabela(resumo, "Mappings locais", str(local_count))
+    linha_tabela(resumo, "Mappings remotos", str(remote_count))
+
+    console.print(
+        Panel(
+            resumo,
+            title="[bold]RESUMO MPLS / LDP[/bold]",
+            border_style="magenta",
+            box=box.ROUNDED,
+            expand=False,
+            width=72,
+        )
+    )
+
+    if vizinhos:
+        tabela_vizinhos = Table(
+            box=box.ROUNDED,
+            header_style="bold cyan",
+            title="Vizinhos LDP",
+        )
+        tabela_vizinhos.add_column("Transport")
+        tabela_vizinhos.add_column("Local transport")
+        tabela_vizinhos.add_column("Peer")
+        tabela_vizinhos.add_column("Estado")
+        tabela_vizinhos.add_column("Flags")
+
+        for vizinho in vizinhos:
+            flags = vizinho.get("_flags", "").upper()
+            estado = vizinho.get("state", "").lower()
+            operacional = "O" in flags or estado == "operational"
+            tabela_vizinhos.add_row(
+                vizinho.get("transport", "—"),
+                vizinho.get("local-transport", "—"),
+                vizinho.get("peer", "—"),
+                Text(
+                    "OPERATIONAL" if operacional else (estado.upper() or "INATIVO"),
+                    style="bold green" if operacional else "bold red",
+                ),
+                flags or "—",
+            )
+
+        console.print(tabela_vizinhos)
+    else:
+        console.print("[dim]Nenhum vizinho LDP encontrado neste equipamento.[/dim]")
+
+    if resultados["forwarding"].ok:
+        console.print(
+            Panel(
+                resultados["forwarding"].output or "Tabela vazia.",
+                title="[bold]FORWARDING TABLE MPLS[/bold]",
+                border_style="blue",
+                box=box.ROUNDED,
+            )
+        )
+
+    if resultados["local"].ok:
+        console.print(
+            Panel(
+                resultados["local"].output or "Nenhum mapping local.",
+                title="[bold]LDP LOCAL MAPPING[/bold]",
+                border_style="green",
+                box=box.ROUNDED,
+            )
+        )
+
+    if resultados["remote"].ok:
+        console.print(
+            Panel(
+                resultados["remote"].output or "Nenhum mapping remoto.",
+                title="[bold]LDP REMOTE MAPPING[/bold]",
+                border_style="yellow",
+                box=box.ROUNDED,
+            )
+        )
+
+
 async def consultar_oid_manual(router: Router) -> None:
     limpar_tela()
     console.rule(f"[bold cyan]{router.nome} — CONSULTA SNMP[/bold cyan]")
@@ -1450,8 +1727,9 @@ async def menu_equipamento(router: Router, usuario: str, senha: str) -> None:
             ("6", "Leases DHCP ativas"),
             ("7", "Tabela ARP completa"),
             ("8", "Rotas"),
-            ("9", "Consulta manual SNMP"),
-            ("10", "Comando manual SSH"),
+            ("9", "MPLS / LDP"),
+            ("10", "Consulta manual SNMP"),
+            ("11", "Comando manual SSH"),
             ("0", "Voltar"),
         ]
 
@@ -1471,7 +1749,7 @@ async def menu_equipamento(router: Router, usuario: str, senha: str) -> None:
 
         opcao = Prompt.ask(
             "Escolha",
-            choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"],
+            choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"],
         )
 
         if opcao == "0":
@@ -1517,8 +1795,10 @@ async def menu_equipamento(router: Router, usuario: str, senha: str) -> None:
                 "/ip route print detail without-paging",
             )
         elif opcao == "9":
-            await consultar_oid_manual(router)
+            await mostrar_mpls_ldp(router, usuario, senha)
         elif opcao == "10":
+            await consultar_oid_manual(router)
+        elif opcao == "11":
             await comando_manual_ssh(router, usuario, senha)
 
         pausar()
